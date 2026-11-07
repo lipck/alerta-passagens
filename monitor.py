@@ -31,6 +31,8 @@ HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "30"))
 MIN_HISTORY_DAYS = int(os.getenv("MIN_HISTORY_DAYS", "3"))  # dias de histórico p/ confiar na média
 SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", "9"))  # resumo diário às 9h (horário de Brasília)
 MAX_ALERTS_PER_RUN = int(os.getenv("MAX_ALERTS_PER_RUN", "5"))
+INTERNATIONAL_ONLY = os.getenv("INTERNATIONAL_ONLY", "true").lower() == "true"  # só destinos fora do país
+HOME_COUNTRY = os.getenv("HOME_COUNTRY", "BR")
 TZ = ZoneInfo(os.getenv("TIMEZONE", "America/Sao_Paulo"))
 
 TP_TOKEN = os.getenv("TRAVELPAYOUTS_TOKEN", "")
@@ -223,7 +225,9 @@ def refresh_reference_data(state):
     """Nomes de cidades e companhias (atualiza uma vez por semana)."""
     ref = state.get("ref", {})
     updated = ref.get("updated")
-    if updated and (date.today() - date.fromisoformat(updated)).days < 7:
+    fresh = updated and (date.today() - date.fromisoformat(updated)).days < 7
+    has_country_codes = ref.get("version") == 2
+    if fresh and has_country_codes:
         return
     try:
         cities = http_get_json(f"{API}/data/en/cities.json", timeout=90)
@@ -231,9 +235,14 @@ def refresh_reference_data(state):
         airlines = http_get_json(f"{API}/data/en/airlines.json", timeout=90)
         country_names = {c["code"]: (c.get("name") or c["code"]) for c in countries}
         state["ref"] = {
+            "version": 2,
             "updated": date.today().isoformat(),
             "cities": {
-                c["code"]: [c.get("name") or c["code"], country_names.get(c.get("country_code"), "")]
+                c["code"]: [
+                    c.get("name") or c["code"],
+                    country_names.get(c.get("country_code"), ""),
+                    c.get("country_code") or "",
+                ]
                 for c in cities
             },
             "airlines": {a["code"]: (a.get("name") or a["code"]) for a in airlines if a.get("code")},
@@ -247,8 +256,25 @@ def city_name(state, code):
     c = state.get("ref", {}).get("cities", {}).get(code)
     if not c:
         return code
-    name, country = c
+    name, country = c[0], c[1]
     return f"{name}, {country}" if country else name
+
+
+def country_code(state, code):
+    c = state.get("ref", {}).get("cities", {}).get(code)
+    return c[2] if c and len(c) > 2 else ""
+
+
+def filter_international(state, offers):
+    """Mantém só destinos fora do país de origem (destinos de país desconhecido também ficam de fora)."""
+    if not INTERNATIONAL_ONLY:
+        return offers
+    out = []
+    for o in offers:
+        cc = country_code(state, o["dest"])
+        if cc and cc != HOME_COUNTRY:
+            out.append(o)
+    return out
 
 
 def airline_name(state, code):
@@ -364,7 +390,8 @@ def summary_message(state, offers, title="☀️ <b>Resumo do dia</b>"):
         if o["dest"] not in best or o["price"] < best[o["dest"]]["price"]:
             best[o["dest"]] = o
     top = sorted(best.values(), key=lambda o: o["price"])[:10]
-    lines = [f"{title} — destinos mais baratos saindo do Rio:"]
+    kind = "internacionais " if INTERNATIONAL_ONLY else ""
+    lines = [f"{title} — destinos {kind}mais baratos saindo do Rio:"]
     for o in top:
         lines.append(
             f"• {city_name(state, o['dest'])}: <b>{brl(o['price'])}</b> "
@@ -387,10 +414,13 @@ def main():
     resolve_chat_id(state)
     refresh_reference_data(state)
 
-    offers = fetch_offers()
-    log(f"{len(offers)} ofertas de ida e volta encontradas para {len({o['dest'] for o in offers})} destinos.")
+    all_offers = fetch_offers()
+    offers = filter_international(state, all_offers)
+    log(f"{len(all_offers)} ofertas de ida e volta encontradas; "
+        f"{len(offers)} para {len({o['dest'] for o in offers})} destinos "
+        f"{'internacionais' if INTERNATIONAL_ONLY else 'no total'}.")
 
-    if not offers:
+    if not all_offers:
         fails = state.get("consecutive_failures", 0) + 1
         state["consecutive_failures"] = fails
         if fails == 8:  # ~2 horas sem dados
