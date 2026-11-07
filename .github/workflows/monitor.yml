@@ -2,7 +2,7 @@ name: Alerta de Passagens
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # a cada 15 minutos (o GitHub pode atrasar alguns minutos)
+    - cron: "7,22,37,52 * * * *"   # a cada 15 minutos, fora do horário de pico do GitHub
   workflow_dispatch:
     inputs:
       teste:
@@ -66,6 +66,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$(date -u +%H)" = "06" ] && [ "$(date -u +%M)" -lt "15" ]; then
+          if [ "$(date -u +%H)" = "06" ] && [ "$(date -u +%M)" -lt "20" ]; then
             gh api -X PUT "repos/${{ github.repository }}/actions/workflows/monitor.yml/enable" || true
           fi
