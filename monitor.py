@@ -83,28 +83,67 @@ def fmt_date(iso):
 # Telegram
 # ----------------------------------------------------------------------------
 def resolve_chat_id(state):
-    """Descobre sozinho o chat do usuário (a partir do 'oi' enviado ao bot) e guarda no histórico."""
+    """
+    Define para onde os alertas vão.
+    - Chat pessoal do dono: descoberto pelo primeiro 'oi'/Start enviado ao bot.
+    - Grupo: se o DONO adicionar o bot a um grupo, os alertas passam a ir para o grupo
+      (grupos criados por outras pessoas são ignorados). Se o bot sair do grupo,
+      volta a enviar no chat pessoal.
+    """
     global TG_CHAT_ID
-    if TG_CHAT_ID:
-        return
-    if state.get("chat_id"):
-        TG_CHAT_ID = state["chat_id"]
-        return
-    if not TG_TOKEN:
+    if TG_CHAT_ID or not TG_TOKEN:
         return
     try:
-        data = http_get_json(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates")
-        for upd in reversed(data.get("result", [])):
-            msg = upd.get("message") or upd.get("my_chat_member") or {}
-            chat = msg.get("chat", {})
-            if chat.get("id"):
-                TG_CHAT_ID = str(chat["id"])
-                state["chat_id"] = TG_CHAT_ID
-                log("Chat do Telegram identificado automaticamente.")
-                return
-        log("Chat do Telegram ainda não identificado: mande um 'oi' para o seu bot.")
+        offset = state.get("tg_offset", 0)
+        data = http_get_json(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={offset}&timeout=0")
+        for upd in data.get("result", []):
+            state["tg_offset"] = upd["update_id"] + 1
+            process_update(state, upd)
     except Exception as e:  # noqa: BLE001
-        log(f"Não foi possível identificar o chat do Telegram: {e}")
+        log(f"Não foi possível consultar o Telegram: {e}")
+
+    TG_CHAT_ID = state.get("group_id") or state.get("chat_id") or ""
+    if not TG_CHAT_ID:
+        log("Chat do Telegram ainda não identificado: mande um 'oi' para o seu bot.")
+
+
+def process_update(state, upd):
+    owner = state.get("chat_id")
+    msg = upd.get("message") or {}
+    chat = msg.get("chat", {})
+
+    # 1) Primeiro contato no privado define o dono
+    if chat.get("type") == "private" and not owner:
+        state["chat_id"] = str(chat["id"])
+        log("Chat pessoal do Telegram identificado automaticamente.")
+        return
+
+    # 2) Grupo virou supergrupo: o ID muda
+    if msg.get("migrate_to_chat_id") and str(chat.get("id")) == state.get("group_id"):
+        state["group_id"] = str(msg["migrate_to_chat_id"])
+        log("Grupo atualizado para supergrupo; ID ajustado.")
+        return
+
+    # 3) Bot adicionado/removido de um grupo
+    member = upd.get("my_chat_member")
+    if not member:
+        return
+    gchat = member.get("chat", {})
+    if gchat.get("type") not in ("group", "supergroup"):
+        return
+    status = member.get("new_chat_member", {}).get("status")
+    added_by = str(member.get("from", {}).get("id", ""))
+    gid = str(gchat["id"])
+    if status in ("member", "administrator"):
+        if owner and added_by == owner:
+            state["group_id"] = gid
+            state["group_welcome_pending"] = True
+            log(f"Bot adicionado ao grupo '{gchat.get('title', '')}'. Alertas passam a ir para o grupo.")
+        else:
+            log("Bot adicionado a um grupo por outra pessoa; ignorado.")
+    elif status in ("left", "kicked") and gid == state.get("group_id"):
+        state.pop("group_id", None)
+        log("Bot removido do grupo; alertas voltam para o chat pessoal.")
 
 
 def telegram(text):
@@ -412,6 +451,9 @@ def main():
 
     state = load_state()
     resolve_chat_id(state)
+    if state.pop("group_welcome_pending", False):
+        telegram("✈️ <b>Pronto!</b> A partir de agora os alertas de passagens internacionais "
+                 "saindo do Rio chegam neste grupo.")
     refresh_reference_data(state)
 
     all_offers = fetch_offers()
