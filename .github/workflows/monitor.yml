@@ -1,0 +1,71 @@
+name: Alerta de Passagens
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # a cada 15 minutos (o GitHub pode atrasar alguns minutos)
+  workflow_dispatch:
+    inputs:
+      teste:
+        description: "Enviar mensagem de teste no Telegram?"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: write   # necessário para manter o agendamento ativo (ver último passo)
+
+concurrency:
+  group: alerta-passagens
+  cancel-in-progress: false
+
+jobs:
+  monitorar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # ---- Ajuste aqui as suas preferências ----
+      ORIGIN: "RIO"            # RIO = Galeão + Santos Dumont
+      DISCOUNT: "0.40"         # avisar quando estiver 40% abaixo do normal
+      MONTHS_AHEAD: "8"        # buscar viagens nos próximos 8 meses
+      MIN_TRIP_DAYS: "3"       # viagem de no mínimo 3 dias
+      MAX_TRIP_DAYS: "30"      # e no máximo 30 dias
+      SUMMARY_HOUR: "9"        # resumo diário às 9h (horário de Brasília)
+      # ---- Segredos (cadastrados em Settings > Secrets and variables > Actions) ----
+      TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.teste }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restaurar histórico de preços
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: precos-${{ github.run_id }}
+          restore-keys: precos-
+
+      - name: Buscar preços e enviar alertas
+        run: python monitor.py
+
+      - name: Salvar histórico de preços
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: precos-${{ github.run_id }}
+
+      # O GitHub pausa agendamentos de repositórios sem atividade por 60 dias.
+      # Uma vez por dia (na execução de ~3h da manhã) reativamos o agendamento.
+      - name: Manter agendamento ativo
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%H)" = "06" ] && [ "$(date -u +%M)" -lt "15" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/monitor.yml/enable" || true
+          fi
